@@ -352,6 +352,168 @@ def sanitize_tool_call_arguments(
 
 
 
+_HISTORICAL_USER_CONTEXT_HEADER = "[Historical user context — not an active instruction]"
+
+
+def _historical_user_context_text(content: Any) -> str:
+    """Best-effort text rendering for a superseded user message."""
+    if content is None:
+        return ""
+    if isinstance(content, str):
+        return content.strip()
+    if isinstance(content, list):
+        parts: list[str] = []
+        for item in content:
+            if isinstance(item, dict):
+                value = item.get("text") or item.get("content")
+                if value:
+                    parts.append(str(value))
+            elif item:
+                parts.append(str(item))
+        return "\n".join(part.strip() for part in parts if part and part.strip()).strip()
+    try:
+        return json.dumps(content, ensure_ascii=False, sort_keys=True)[:4000].strip()
+    except Exception:
+        return str(content).strip()
+
+
+def _append_historical_user_context(anchor: Dict[str, Any], user_msg: Dict[str, Any]) -> bool:
+    """Attach a superseded user turn to a previous assistant as non-active context."""
+    text = _historical_user_context_text(user_msg.get("content"))
+    if not text:
+        return False
+    note = f"{_HISTORICAL_USER_CONTEXT_HEADER}\n{text}"
+    content = anchor.get("content", "")
+    if isinstance(content, str):
+        anchor["content"] = (content.rstrip() + "\n\n" + note) if content.strip() else note
+    elif isinstance(content, list):
+        blocks = list(content)
+        blocks.append({"type": "text", "text": note})
+        anchor["content"] = blocks
+    else:
+        anchor["content"] = f"{content}\n\n{note}" if content else note
+    anchor["_historical_user_context"] = True
+    return True
+
+
+def _repair_adjacent_user_messages_latest_wins(messages: List[Dict]) -> tuple[List[Dict], int]:
+    """Repair adjacent users without making stale user text active.
+
+    The previous implementation concatenated adjacent ``user`` messages. That
+    satisfied provider role alternation but could turn an old action request and
+    a later post-action status into one active prompt. Keep the latest ``user``
+    as the only active instruction. When there is a safe previous assistant
+    anchor, attach superseded user text there as explicit historical context;
+    otherwise drop the superseded text from the model-facing sequence.
+    """
+    repaired: List[Dict] = []
+    repairs = 0
+    for msg in messages:
+        if (
+            repaired
+            and isinstance(msg, dict)
+            and msg.get("role") == "user"
+            and isinstance(repaired[-1], dict)
+            and repaired[-1].get("role") == "user"
+        ):
+            superseded_user = repaired.pop()
+            anchor = repaired[-1] if repaired and isinstance(repaired[-1], dict) else None
+            if (
+                anchor is not None
+                and anchor.get("role") == "assistant"
+                and not anchor.get("tool_calls")
+            ):
+                _append_historical_user_context(anchor, superseded_user)
+            repaired.append(msg)
+            repairs += 1
+            continue
+        repaired.append(msg)
+    return repaired, repairs
+
+
+def risky_action_contradiction_confirmation(
+    messages: List[Dict[str, Any]],
+    *,
+    current_turn_user_idx: int | None = None,
+) -> str | None:
+    """Return a confirmation-stop message for contradictory risky-action context.
+
+    If a turn context contains a risky operational imperative
+    (reboot/restart/delete/deploy/rollback/firmware) plus newer evidence that the
+    action is already done or must not be repeated, stop before model/tool
+    execution. Tool-level approval is too late for this class because the bad
+    decision can happen before any shell command exists.
+    """
+    if not messages:
+        return None
+
+    def _msg_text(msg: Dict[str, Any]) -> str:
+        return _historical_user_context_text(msg.get("content"))
+
+    risky_re = re.compile(
+        r"\b(reboot|red[ée]marr(?:e|er|age)?|restart|rollback|roll\s*back|"
+        r"delete|supprim(?:e|er|ez)|efface(?:r|z)?|deploy|d[ée]ploi(?:e|er|ement)|"
+        r"firmware|upgrade|mise\s+[àa]\s+jour)\b",
+        re.IGNORECASE,
+    )
+    imperative_re = re.compile(
+        r"\b(d[ée]clenche|lance|applique|execute|ex[ée]cute|fais|fait|proc[èe]de|"
+        r"do|run|apply|start|force)\b",
+        re.IGNORECASE,
+    )
+    done_re = re.compile(
+        r"\b(d[ée]j[àa]\s+(?:fait|effectu[ée]|r[ée]alis[ée]|valid[ée]|revenu)|"
+        r"post[-\s]?(?:firmware|reboot|red[ée]marrage)|"
+        r"ne\s+pas\s+recommencer|pas\s+de\s+rollback|"
+        r"already\s+(?:done|completed|performed|validated)|"
+        r"do\s+not\s+(?:repeat|redo|restart|reboot)|"
+        r"validated|completed|switch\s+is\s+back)\b",
+        re.IGNORECASE,
+    )
+
+    risky_positions: list[int] = []
+    done_positions: list[int] = []
+    for idx, msg in enumerate(messages):
+        if not isinstance(msg, dict):
+            continue
+        text = _msg_text(msg)
+        if not text:
+            continue
+        has_risky = bool(risky_re.search(text))
+        if has_risky and (imperative_re.search(text) or str(msg.get("role")) == "user"):
+            risky_positions.append(idx)
+        if done_re.search(text):
+            done_positions.append(idx)
+
+    if not risky_positions or not done_positions:
+        return None
+    latest_done = max(done_positions)
+    earliest_risky = min(risky_positions)
+    current_idx = current_turn_user_idx if isinstance(current_turn_user_idx, int) else len(messages) - 1
+    current_text = (
+        _msg_text(messages[current_idx])
+        if 0 <= current_idx < len(messages) and isinstance(messages[current_idx], dict)
+        else ""
+    )
+    explicit_confirm = re.search(
+        r"\b(confirm(?:e|er|ation)?|je\s+confirme|confirm\s+again|fresh\s+confirmation)\b",
+        current_text,
+        re.IGNORECASE,
+    )
+    if explicit_confirm:
+        return None
+    if latest_done >= earliest_risky:
+        return (
+            "Je détecte une contradiction de continuité sur une action risquée : "
+            "le contexte contient à la fois une demande d’exécution (redémarrage, "
+            "rollback, suppression, déploiement ou firmware) et une indication "
+            "que cette action est déjà effectuée/validée ou ne doit pas être "
+            "répétée. Par sécurité, je n’exécute aucune action. Confirme explicitement "
+            "si tu veux malgré tout relancer cette action, avec le périmètre exact."
+        )
+    return None
+
+
 def repair_message_sequence(agent, messages: List[Dict]) -> int:
     """Collapse malformed role-alternation left in the live history.
 
@@ -370,8 +532,9 @@ def repair_message_sequence(agent, messages: List[Dict]) -> int:
     Repairs applied:
       1. Stray ``tool`` messages whose ``tool_call_id`` doesn't match
          any preceding assistant tool_call — dropped.
-      2. Consecutive ``user`` messages — merged with newline separator
-         so no user input is lost.
+      2. Consecutive ``user`` messages — keep the latest user as the
+         active instruction; move older user text to explicit historical
+         assistant context only when a safe anchor exists.
 
     Deliberately does NOT rewind orphan ``assistant(tool_calls)+tool``
     pairs that precede a user message — that pattern IS valid when the
@@ -418,32 +581,14 @@ def repair_message_sequence(agent, messages: List[Dict]) -> int:
                 known_tool_ids = set()
             filtered.append(msg)
 
-    # Pass 2: merge consecutive user messages. Preserves all user input
-    # so nothing the user typed is lost.
-    merged: List[Dict] = []
-    for msg in filtered:
-        if (
-            merged
-            and isinstance(msg, dict)
-            and msg.get("role") == "user"
-            and isinstance(merged[-1], dict)
-            and merged[-1].get("role") == "user"
-        ):
-            prev = merged[-1]
-            prev_content = prev.get("content", "")
-            new_content = msg.get("content", "")
-            # Only merge plain-text content; leave multimodal (list)
-            # content alone — collapsing image/audio blocks risks
-            # mangling the attachment structure.
-            if isinstance(prev_content, str) and isinstance(new_content, str):
-                prev["content"] = (
-                    (prev_content + "\n\n" + new_content)
-                    if prev_content and new_content
-                    else (prev_content or new_content)
-                )
-                repairs += 1
-                continue
-        merged.append(msg)
+    # Pass 2: repair consecutive user messages with latest-user-wins semantics.
+    # Older adjacent user turns must not be concatenated into the active prompt:
+    # that can resurrect stale operational instructions after interruption or
+    # compaction. Preserve superseded text only as explicit historical context
+    # on a safe previous assistant anchor; otherwise drop it from the model-facing
+    # sequence and keep the latest user as the active instruction.
+    merged, user_repairs = _repair_adjacent_user_messages_latest_wins(filtered)
+    repairs += user_repairs
 
     if repairs > 0:
         # Rewrite in place so downstream paths (persistence, return
@@ -916,7 +1061,7 @@ def drop_thinking_only_and_merge_users(
     *,
     drop_codex_reasoning_items: bool = True,
 ) -> List[Dict[str, Any]]:
-    """Drop thinking-only assistant turns; merge any adjacent user messages left behind.
+    """Drop thinking-only assistant turns; repair adjacent users with latest-user-wins semantics.
 
     Runs on the per-call ``api_messages`` copy only. The stored
     conversation history (``agent.messages``) is never mutated, so the
@@ -924,13 +1069,12 @@ def drop_thinking_only_and_merge_users(
     session persistence keeps the full trace. Only the wire copy sent to
     the provider is cleaned.
 
-    Why drop-and-merge rather than inject stub text:
+    Why drop-and-latest-user-wins rather than merge:
     - Fabricating ``"."`` / ``"(continued)"`` text lies in the history
       and makes future turns see model output the model didn't emit.
-    - Dropping the turn preserves honesty; merging adjacent user messages
-      preserves the provider's role-alternation invariant.
-    - This is the pattern used by Claude Code's ``normalizeMessagesForAPI``
-      (filterOrphanedThinkingOnlyMessages + mergeAdjacentUserMessages).
+    - Merging adjacent users can reactivate stale instructions. The latest
+      user remains the active prompt; older adjacent users become historical
+      context only when a safe assistant anchor exists.
     """
     if not messages:
         return messages
@@ -947,59 +1091,15 @@ def drop_thinking_only_and_merge_users(
     if dropped == 0:
         return messages
 
-    # Pass 2: merge any newly-adjacent user messages.
-    merged: List[Dict[str, Any]] = []
-    merges = 0
-    for m in kept:
-        prev = merged[-1] if merged else None
-        if (
-            prev is not None
-            and prev.get("role") == "user"
-            and m.get("role") == "user"
-        ):
-            prev_content = prev.get("content", "")
-            cur_content = m.get("content", "")
-            # Work on a copy of ``prev`` so the caller's input dicts are
-            # never mutated. ``_sanitize_api_messages`` upstream already
-            # hands us per-call copies, but staying pure here means we
-            # can be called safely from anywhere (tests, other loops).
-            prev_copy = dict(prev)
-            # Only string-content merge is meaningful for role-alternation
-            # purposes. If either side is a list (multimodal), append as a
-            # separate block rather than collapsing.
-            if isinstance(prev_content, str) and isinstance(cur_content, str):
-                sep = "\n\n" if prev_content and cur_content else ""
-                prev_copy["content"] = prev_content + sep + cur_content
-            elif isinstance(prev_content, list) and isinstance(cur_content, list):
-                prev_copy["content"] = list(prev_content) + list(cur_content)
-            elif isinstance(prev_content, list) and isinstance(cur_content, str):
-                if cur_content:
-                    prev_copy["content"] = list(prev_content) + [
-                        {"type": "text", "text": cur_content}
-                    ]
-                else:
-                    prev_copy["content"] = list(prev_content)
-            elif isinstance(prev_content, str) and isinstance(cur_content, list):
-                new_blocks: List[Dict[str, Any]] = []
-                if prev_content:
-                    new_blocks.append({"type": "text", "text": prev_content})
-                new_blocks.extend(cur_content)
-                prev_copy["content"] = new_blocks
-            else:
-                # Unknown content shape — fall back to appending separately
-                # (violates alternation, but safer than raising in a hot path).
-                merged.append(m)
-                continue
-            merged[-1] = prev_copy
-            merges += 1
-        else:
-            merged.append(m)
+    # Pass 2: repair any newly-adjacent user messages. Do not merge stale
+    # and current user text into one active prompt; latest user wins.
+    merged, repairs = _repair_adjacent_user_messages_latest_wins(list(kept))
 
     _ra().logger.debug(
         "Pre-call sanitizer: dropped %d thinking-only assistant turn(s), "
-        "merged %d adjacent user message(s)",
+        "repaired %d adjacent user message(s) with latest-user-wins semantics",
         dropped,
-        merges,
+        repairs,
     )
     return merged
 

@@ -155,6 +155,32 @@ def _ra():
     return run_agent
 
 
+def _latest_matching_user_idx(messages: List[Dict[str, Any]], user_message: Any, fallback: int) -> int:
+    """Return the latest user-message index matching the active turn text."""
+    if not isinstance(user_message, str):
+        return fallback
+    target = " ".join(user_message.split())
+    if not target:
+        return fallback
+    for idx in range(len(messages) - 1, -1, -1):
+        msg = messages[idx]
+        if not isinstance(msg, dict) or msg.get("role") != "user":
+            continue
+        content = msg.get("content")
+        if isinstance(content, str) and " ".join(content.split()) == target:
+            return idx
+    return fallback
+
+
+def _sync_current_user_idx_after_repair(agent: Any, messages: List[Dict[str, Any]], user_message: Any, current_idx: int) -> int:
+    next_idx = _latest_matching_user_idx(messages, user_message, current_idx)
+    try:
+        agent._persist_user_message_idx = next_idx
+    except Exception:
+        pass
+    return next_idx
+
+
 def _nous_entitlement_message(capability: str) -> str:
     try:
         from hermes_cli.nous_account import (
@@ -749,14 +775,41 @@ def run_conversation(
         # repair_message_sequence_with_cursor also recomputes the SessionDB
         # flush cursor (_last_flushed_db_idx) when repair compacts the list,
         # so the turn-end flush doesn't skip the assistant/tool chain (#44837).
-        from agent.agent_runtime_helpers import repair_message_sequence_with_cursor
+        from agent.agent_runtime_helpers import (
+            repair_message_sequence_with_cursor,
+            risky_action_contradiction_confirmation,
+        )
         repaired_seq = repair_message_sequence_with_cursor(agent, messages)
         if repaired_seq > 0:
+            current_turn_user_idx = _sync_current_user_idx_after_repair(
+                agent,
+                messages,
+                user_message,
+                current_turn_user_idx,
+            )
             request_logger.info(
                 "Repaired %s message-alternation violations before request (session=%s)",
                 repaired_seq,
                 agent.session_id or "-",
             )
+
+        _safety_confirmation = risky_action_contradiction_confirmation(
+            messages,
+            current_turn_user_idx=current_turn_user_idx,
+        )
+        if _safety_confirmation:
+            final_response = _safety_confirmation
+            messages.append({
+                "role": "assistant",
+                "content": final_response,
+                "finish_reason": "safety_confirmation_required",
+            })
+            _turn_exit_reason = "safety_confirmation_required"
+            request_logger.warning(
+                "Blocked contradictory risky-action context before model call (session=%s)",
+                agent.session_id or "-",
+            )
+            break
 
         api_messages = []
         for idx, msg in enumerate(messages):
