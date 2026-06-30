@@ -326,7 +326,7 @@ def test_risky_action_contradiction_requires_confirmation_before_model_call():
     messages = [
         {"role": "user", "content": "Déclenche le reboot firmware du switch."},
         {"role": "assistant", "content": "Reboot firmware effectué et validé. Pas de rollback."},
-        {"role": "user", "content": "Telnet est aussi bien que SSH ?"},
+        {"role": "user", "content": "Relance le reboot du switch."},
     ]
 
     response = risky_action_contradiction_confirmation(
@@ -337,6 +337,51 @@ def test_risky_action_contradiction_requires_confirmation_before_model_call():
     assert response is not None
     assert "contradiction" in response.lower()
     assert "n’exécute aucune action" in response
+
+
+def test_risky_action_contradiction_allows_unrelated_later_turn():
+    messages = [
+        {"role": "user", "content": "Déclenche le reboot firmware du switch."},
+        {"role": "assistant", "content": "Reboot firmware effectué et validé. Pas de rollback."},
+        {"role": "user", "content": "Mon installation Hermès est cassée, corrige la gestion historique."},
+    ]
+
+    response = risky_action_contradiction_confirmation(
+        messages,
+        current_turn_user_idx=2,
+    )
+
+    assert response is None
+
+
+def test_risky_action_contradiction_allows_unrelated_network_question():
+    messages = [
+        {"role": "user", "content": "Déclenche le reboot firmware du switch."},
+        {"role": "assistant", "content": "Reboot firmware effectué et validé. Pas de rollback."},
+        {"role": "user", "content": "Telnet est aussi bien que SSH ?"},
+    ]
+
+    response = risky_action_contradiction_confirmation(
+        messages,
+        current_turn_user_idx=2,
+    )
+
+    assert response is None
+
+
+def test_risky_action_contradiction_blocks_ambiguous_continue():
+    messages = [
+        {"role": "user", "content": "Déclenche le reboot firmware du switch."},
+        {"role": "assistant", "content": "Reboot firmware effectué et validé. Pas de rollback."},
+        {"role": "user", "content": "Continue."},
+    ]
+
+    response = risky_action_contradiction_confirmation(
+        messages,
+        current_turn_user_idx=2,
+    )
+
+    assert response is not None
 
 
 def test_risky_action_contradiction_allows_explicit_fresh_confirmation():

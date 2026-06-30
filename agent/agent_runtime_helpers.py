@@ -502,7 +502,30 @@ def risky_action_contradiction_confirmation(
     )
     if explicit_confirm:
         return None
-    if latest_done >= earliest_risky:
+
+    # Do not let stale risky history poison unrelated future turns.  The guard
+    # exists to stop replay/continuation of an ambiguous risky action, not to
+    # freeze an entire session forever once it contains “reboot already done”.
+    current_has_risky = bool(risky_re.search(current_text))
+    current_has_imperative = bool(imperative_re.search(current_text))
+    current_has_done = bool(done_re.search(current_text))
+    current_is_ambiguous_continuation = bool(
+        re.search(
+            r"\b(continue|continuer|reprend(?:s|re|re)?|reprise|relance|reload|retry|"
+            r"rerun|again|encore|vas[-\s]?y|go\s+on|poursuis|fais\s+la\s+suite|"
+            r"next\s+step|étape\s+suivante|suite)\b",
+            current_text,
+            re.IGNORECASE,
+        )
+    )
+    current_requests_risky_action = current_has_risky and (
+        current_has_imperative or current_is_ambiguous_continuation
+    )
+
+    if latest_done >= earliest_risky and (
+        current_requests_risky_action
+        or (current_is_ambiguous_continuation and not current_has_done)
+    ):
         return (
             "Je détecte une contradiction de continuité sur une action risquée : "
             "le contexte contient à la fois une demande d’exécution (redémarrage, "
