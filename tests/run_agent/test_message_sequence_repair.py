@@ -78,7 +78,7 @@ def test_drop_scaffolding_handles_multiple_parallel_tool_results():
 
 # ── _repair_message_sequence ───────────────────────────────────────────────
 
-def test_repair_merges_consecutive_user_messages():
+def test_repair_consecutive_user_messages_latest_user_wins():
     agent = _bare_agent()
     messages = [
         {"role": "user", "content": "first"},
@@ -90,7 +90,27 @@ def test_repair_merges_consecutive_user_messages():
     assert repairs == 1
     assert len(messages) == 1
     assert messages[0]["role"] == "user"
-    assert messages[0]["content"] == "first\n\nsecond"
+    assert messages[0]["content"] == "second"
+    assert "first" not in messages[0]["content"]
+
+
+def test_repair_consecutive_user_preserves_old_text_as_non_active_historical_context_when_safe_anchor_exists():
+    agent = _bare_agent()
+    messages = [
+        {"role": "user", "content": "question"},
+        {"role": "assistant", "content": "answer"},
+        {"role": "user", "content": "old instruction"},
+        {"role": "user", "content": "current instruction"},
+    ]
+
+    repairs = AIAgent._repair_message_sequence(agent, messages)
+
+    assert repairs == 1
+    assert [m["role"] for m in messages] == ["user", "assistant", "user"]
+    assert messages[-1]["content"] == "current instruction"
+    assert "old instruction" not in messages[-1]["content"]
+    assert "Historical user context" in messages[1]["content"]
+    assert "old instruction" in messages[1]["content"]
 
 
 def test_repair_preserves_user_content_when_one_side_empty():
@@ -162,8 +182,8 @@ def test_repair_leaves_valid_conversation_unchanged():
     assert messages == original
 
 
-def test_repair_preserves_multimodal_user_content():
-    """Multimodal (list) content must NOT be merged — risks mangling attachments."""
+def test_repair_multimodal_consecutive_user_latest_user_wins():
+    """Multimodal stale user content must not be merged into the active prompt."""
     agent = _bare_agent()
     messages = [
         {"role": "user", "content": [{"type": "text", "text": "hi"},
@@ -173,9 +193,7 @@ def test_repair_preserves_multimodal_user_content():
 
     AIAgent._repair_message_sequence(agent, messages)
 
-    # The multimodal user message stays as a distinct message — no merge
-    assert len(messages) == 2
-    assert isinstance(messages[0]["content"], list)
+    assert messages == [{"role": "user", "content": "follow-up"}]
 
 
 def test_repair_empty_messages_returns_zero():
@@ -229,7 +247,7 @@ def test_cursor_rewinds_when_compaction_happens_before_cursor():
     A plain min() clamp does NOT catch this case."""
     agent = _bare_agent()
     flushed_a = {"role": "user", "content": "first"}
-    flushed_b = {"role": "user", "content": "second"}  # merged into flushed_a
+    flushed_b = {"role": "user", "content": "second"}  # survives as latest active user
     unflushed_assistant = {"role": "assistant", "content": "answer"}
     messages = [flushed_a, flushed_b, unflushed_assistant]
     agent._last_flushed_db_idx = 2  # the two user rows are flushed
@@ -298,7 +316,6 @@ def test_flush_guard_clamps_overshooting_cursor():
 
     # min(5, 2) = 2 → nothing skipped below start_idx, cursor settles at 2
     assert agent._last_flushed_db_idx == 2
-
 
 # ── Pass 0: merge consecutive assistant messages (issue #29148, #49147) ─────
 
