@@ -4518,41 +4518,59 @@ class SessionDB:
     def find_live_compression_child(
         self, parent_session_id: str
     ) -> Optional[Dict[str, Any]]:
-        """Return the unique live direct child of a compression-ended session.
+        """Follow a unique compression-continuation chain to its live tip.
 
         A stale agent may observe that another compression path already rotated
-        its parent. Recovery is safe only when the durable lineage identifies
-        exactly one live direct continuation. Multiple children are treated as
-        ambiguous and fail closed rather than guessing which transcript owns
-        subsequent messages.
+        its parent more than once. Recovery is safe only when every hop in the
+        durable lineage identifies exactly one continuation. Multiple eligible
+        children are treated as ambiguous and fail closed rather than guessing
+        which transcript owns subsequent messages.
         """
         if not parent_session_id:
             return None
+        current_session_id = parent_session_id
+        seen: set[str] = set()
         with self._lock:
-            parent = self._conn.execute(
-                "SELECT ended_at, end_reason FROM sessions WHERE id = ?",
-                (parent_session_id,),
-            ).fetchone()
-            if (
-                parent is None
-                or parent["ended_at"] is None
-                or parent["end_reason"] != "compression"
-            ):
+            conn = self._conn
+            if conn is None:
                 return None
-            rows = self._conn.execute(
-                """
-                SELECT * FROM sessions
-                WHERE parent_session_id = ?
-                  AND ended_at IS NULL
-                  AND json_extract(COALESCE(model_config, '{}'), '$._branched_from') IS NULL
-                  AND json_extract(COALESCE(model_config, '{}'), '$._delegate_from') IS NULL
-                  AND COALESCE(source, '') != 'tool'
-                ORDER BY started_at ASC
-                LIMIT 2
-                """,
-                (parent_session_id,),
-            ).fetchall()
-        return dict(rows[0]) if len(rows) == 1 else None
+            for _ in range(100):
+                if current_session_id in seen:
+                    return None
+                seen.add(current_session_id)
+                parent = conn.execute(
+                    "SELECT ended_at, end_reason FROM sessions WHERE id = ?",
+                    (current_session_id,),
+                ).fetchone()
+                if (
+                    parent is None
+                    or parent["ended_at"] is None
+                    or parent["end_reason"] != "compression"
+                ):
+                    return None
+                rows = conn.execute(
+                    """
+                    SELECT * FROM sessions
+                    WHERE parent_session_id = ?
+                      AND (ended_at IS NULL OR end_reason = 'compression')
+                      AND json_extract(COALESCE(model_config, '{}'), '$._branched_from') IS NULL
+                      AND json_extract(COALESCE(model_config, '{}'), '$._delegate_from') IS NULL
+                      AND COALESCE(source, '') != 'tool'
+                    ORDER BY started_at ASC
+                    LIMIT 2
+                    """,
+                    (current_session_id,),
+                ).fetchall()
+                if len(rows) != 1:
+                    return None
+                child = rows[0]
+                child_session_id = str(child["id"] or "")
+                if not child_session_id or child_session_id in seen:
+                    return None
+                if child["ended_at"] is None:
+                    return dict(child)
+                current_session_id = child_session_id
+        return None
 
     def publish_compression_child(
         self,

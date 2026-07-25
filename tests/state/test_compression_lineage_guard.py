@@ -34,6 +34,129 @@ def test_find_live_compression_child_returns_unique_direct_child(db: SessionDB) 
     assert child["ended_at"] is None
 
 
+def test_find_live_compression_child_follows_multi_hop_chain(db: SessionDB) -> None:
+    _compression_parent(db)
+    db.create_session("child-1", source="webui", parent_session_id="parent")
+    db.end_session("child-1", "compression")
+    db.create_session("child-2", source="webui", parent_session_id="child-1")
+    db.end_session("child-2", "compression")
+    db.create_session("live-tip", source="webui", parent_session_id="child-2")
+
+    child = db.find_live_compression_child("parent")
+
+    assert child is not None
+    assert child["id"] == "live-tip"
+    assert child["parent_session_id"] == "child-2"
+    assert child["ended_at"] is None
+
+
+def test_find_live_compression_child_fails_closed_at_ambiguous_hop(
+    db: SessionDB,
+) -> None:
+    _compression_parent(db)
+    db.create_session("child-1", source="webui", parent_session_id="parent")
+    db.end_session("child-1", "compression")
+    db.create_session("tip-a", source="webui", parent_session_id="child-1")
+    db.create_session("tip-b", source="webui", parent_session_id="child-1")
+
+    assert db.find_live_compression_child("parent") is None
+
+
+def test_find_live_compression_child_fails_closed_for_live_and_rotated_siblings(
+    db: SessionDB,
+) -> None:
+    _compression_parent(db)
+    db.create_session("rotated", source="webui", parent_session_id="parent")
+    db.end_session("rotated", "compression")
+    db.create_session("rotated-tip", source="webui", parent_session_id="rotated")
+    db.create_session("stale-live-sibling", source="webui", parent_session_id="parent")
+
+    assert db.find_live_compression_child("parent") is None
+
+
+def test_find_live_compression_child_ignores_non_continuations_at_each_hop(
+    db: SessionDB,
+) -> None:
+    _compression_parent(db)
+    db.create_session("child-1", source="webui", parent_session_id="parent")
+    db.end_session("child-1", "compression")
+    db.create_session(
+        "branch",
+        source="webui",
+        parent_session_id="child-1",
+        model_config={"_branched_from": "child-1"},
+    )
+    db.create_session(
+        "delegate",
+        source="webui",
+        parent_session_id="child-1",
+        model_config={"_delegate_from": "child-1"},
+    )
+    db.create_session("tool-child", source="tool", parent_session_id="child-1")
+    db.create_session("live-tip", source="webui", parent_session_id="child-1")
+
+    child = db.find_live_compression_child("parent")
+
+    assert child is not None
+    assert child["id"] == "live-tip"
+
+
+def test_find_live_compression_child_rejects_noncompression_dead_end(
+    db: SessionDB,
+) -> None:
+    _compression_parent(db)
+    db.create_session("closed-child", source="webui", parent_session_id="parent")
+    db.end_session("closed-child", "agent_close")
+
+    assert db.find_live_compression_child("parent") is None
+
+
+def test_find_live_compression_child_rejects_cycle(db: SessionDB) -> None:
+    _compression_parent(db)
+    db.create_session("child", source="webui", parent_session_id="parent")
+    db.end_session("child", "compression")
+    def _close_cycle(conn) -> None:
+        conn.execute(
+            "UPDATE sessions SET parent_session_id = ? WHERE id = ?",
+            ("child", "parent"),
+        )
+
+    db._execute_write(_close_cycle)
+
+    assert db.find_live_compression_child("parent") is None
+
+
+def test_find_live_compression_child_accepts_maximum_supported_depth(
+    db: SessionDB,
+) -> None:
+    _compression_parent(db)
+    parent = "parent"
+    for index in range(99):
+        child = f"compressed-{index}"
+        db.create_session(child, source="webui", parent_session_id=parent)
+        db.end_session(child, "compression")
+        parent = child
+    db.create_session("deep-live-tip", source="webui", parent_session_id=parent)
+
+    child = db.find_live_compression_child("parent")
+
+    assert child is not None
+    assert child["id"] == "deep-live-tip"
+
+
+def test_find_live_compression_child_bounds_pathological_depth(db: SessionDB) -> None:
+    _compression_parent(db)
+    parent = "parent"
+    for index in range(100):
+        child = f"compressed-{index}"
+        db.create_session(child, source="webui", parent_session_id=parent)
+        db.end_session(child, "compression")
+        parent = child
+    db.create_session("too-deep-tip", source="webui", parent_session_id=parent)
+
+    assert db.find_live_compression_child("parent") is None
+
+
 def test_find_live_compression_child_fails_closed_when_ambiguous(db: SessionDB) -> None:
     _compression_parent(db)
     db.create_session("child-a", source="webui", parent_session_id="parent")
