@@ -2091,7 +2091,7 @@ class AIAgent:
                     ]
                 elif isinstance(msg.get("tool_calls"), list):
                     tool_calls_data = msg["tool_calls"]
-                self._session_db.append_message(
+                _appended = self._session_db.append_message(
                     session_id=self.session_id,
                     role=role,
                     content=content,
@@ -2115,7 +2115,19 @@ class AIAgent:
                     compression_lock_holder=getattr(
                         self, "_active_compression_lock_holder", None
                     ),
+                    with_revision=True,
                 )
+                # Adopt the fence the append actually committed, read inside the
+                # same transaction — never recompute it here, where a concurrent
+                # writer's row would be missed. SessionDB-like adapters that
+                # ignore ``with_revision`` still return a bare id (or nothing);
+                # they own no CAS either, so the agent simply keeps its fence.
+                if isinstance(_appended, tuple) and len(_appended) == 2:
+                    from hermes_state import DurableTranscriptRevision
+
+                    _, durable_revision = _appended
+                    if isinstance(durable_revision, DurableTranscriptRevision):
+                        self._durable_transcript_revision = durable_revision
                 msg[_DB_PERSISTED_MARKER] = True
             # The intrinsic markers are now the sole source of truth. Reset the
             # one-shot seed so no id() outlives this flush to alias a message
@@ -6838,6 +6850,7 @@ class AIAgent:
         persist_user_message: Optional[Any] = None,
         persist_user_timestamp: Optional[float] = None,
         moa_config: Optional[dict[str, Any]] = None,
+        conversation_history_revision: Optional[dict[str, Any]] = None,
     ) -> Dict[str, Any]:
         """Forwarder — see ``agent.conversation_loop.run_conversation``."""
         from agent.aux_accounting import (
@@ -6882,6 +6895,7 @@ class AIAgent:
                     persist_user_message,
                     persist_user_timestamp=persist_user_timestamp,
                     moa_config=moa_config,
+                    conversation_history_revision=conversation_history_revision,
                 )
             finally:
                 reset_accounting_context(acct_token)

@@ -36,12 +36,24 @@ from gateway.session import SessionSource
 
 class _CapturingAgent:
     last_init = None
+    last_run = None
 
     def __init__(self, *args, **kwargs):
         type(self).last_init = dict(kwargs)
         self.tools = []
 
-    def run_conversation(self, user_message, conversation_history=None, task_id=None, persist_user_message=None):
+    def run_conversation(
+        self,
+        user_message,
+        conversation_history=None,
+        conversation_history_revision=None,
+        task_id=None,
+        persist_user_message=None,
+    ):
+        type(self).last_run = {
+            "conversation_history": conversation_history,
+            "conversation_history_revision": conversation_history_revision,
+        }
         return {
             "final_response": "ok",
             "messages": [],
@@ -236,16 +248,19 @@ async def test_run_agent_appends_channel_prompt_to_ephemeral_system_prompt(monke
     monkeypatch.setattr(tools_config, "_get_platform_tools", lambda user_config, platform_key: {"core"})
 
     _CapturingAgent.last_init = None
+    _CapturingAgent.last_run = None
     event = MessageEvent(
         text="hi",
         source=_make_source(),
         message_id="m1",
         channel_prompt="Channel prompt",
     )
+    revision = object()
     result = await runner._run_agent(
         message="hi",
         context_prompt="Context prompt",
         history=[],
+        history_revision=revision,
         source=_make_source(),
         session_id="session-1",
         session_key="agent:main:discord:thread:12345",
@@ -253,6 +268,7 @@ async def test_run_agent_appends_channel_prompt_to_ephemeral_system_prompt(monke
     )
 
     assert result["final_response"] == "ok"
+    assert _CapturingAgent.last_run["conversation_history_revision"] is revision
     assert _CapturingAgent.last_init["ephemeral_system_prompt"] == (
         "Context prompt\n\nChannel prompt\n\nGlobal prompt"
     )
