@@ -1003,6 +1003,11 @@ def resolve_billing_route(
 
     if provider_name == "openai-codex":
         return BillingRoute(provider="openai-codex", model=model, base_url=base_url or "", billing_mode="subscription_included")
+    # Kimi Coding Plan (api.kimi.com/coding and the China variant) is a flat
+    # weekly-quota subscription like Codex — no per-token billing applies.
+    if provider_name in {"kimi-coding", "kimi-coding-cn", "kimi", "moonshot", "kimi-cn", "moonshot-cn"}:
+        kimi_provider = "kimi-coding-cn" if provider_name in {"kimi-coding-cn", "kimi-cn", "moonshot-cn"} else "kimi-coding"
+        return BillingRoute(provider=kimi_provider, model=model.split("/")[-1], base_url=base_url or "", billing_mode="subscription_included")
     if provider_name == "openrouter" or base_url_host_matches(base_url or "", "openrouter.ai"):
         return BillingRoute(provider="openrouter", model=model, base_url=base_url or "", billing_mode="official_models_api")
     if provider_name == "nous" or base_url_host_matches(base_url or "", "inference-api.nousresearch.com"):

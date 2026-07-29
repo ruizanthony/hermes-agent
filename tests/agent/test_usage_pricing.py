@@ -695,3 +695,34 @@ def test_vertex_default_model_estimates_cached_usage(monkeypatch):
 
     assert result.status == "estimated"
     assert result.amount_usd is not None and result.amount_usd > 0
+
+
+def test_kimi_coding_route_is_subscription_included():
+    route = resolve_billing_route("kimi-k3", provider="kimi-coding", base_url="https://api.kimi.com/coding")
+    assert route.billing_mode == "subscription_included"
+    assert route.provider == "kimi-coding"
+
+
+def test_kimi_coding_cn_route_is_subscription_included():
+    route = resolve_billing_route("kimi-k3", provider="kimi-coding-cn")
+    assert route.billing_mode == "subscription_included"
+    assert route.provider == "kimi-coding-cn"
+
+
+def test_kimi_aliases_route_to_coding_subscription():
+    for alias in ("kimi", "moonshot"):
+        route = resolve_billing_route("kimi-k3", provider=alias)
+        assert route.billing_mode == "subscription_included"
+        assert route.provider == "kimi-coding"
+
+
+def test_kimi_estimate_usage_cost_is_included():
+    result = estimate_usage_cost(
+        "kimi-k3",
+        CanonicalUsage(input_tokens=1000, output_tokens=500),
+        provider="kimi-coding",
+        base_url="https://api.kimi.com/coding",
+    )
+
+    assert result.status == "included"
+    assert float(result.amount_usd) == 0.0
