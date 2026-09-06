@@ -123,8 +123,11 @@ def _initialize_schema(conn: sqlite3.Connection) -> None:
     columns = {row[1] for row in conn.execute("PRAGMA table_info(async_delegations)")}
     # origin_session_id: raw api_server session id of the ORIGINATING request
     # (wake target); without it restart-recovered completions are unroutable there.
+    # drop_reason: why a row went terminal ('attempts_exhausted', 'replay_age',
+    # 'target_gone'); restart replay rehabilitates only budget exhaustion.
     for name, sql_type in (("owner_pid", "INTEGER"), ("owner_started_at", "INTEGER"), ("task_json", "TEXT"),
-                           ("delivery_claim", "TEXT"), ("delivery_claimed_at", "REAL"), ("origin_session_id", "TEXT")):
+                           ("delivery_claim", "TEXT"), ("delivery_claimed_at", "REAL"), ("origin_session_id", "TEXT"),
+                           ("drop_reason", "TEXT")):
         if name not in columns:
             conn.execute(f"ALTER TABLE async_delegations ADD COLUMN {name} {sql_type}")
 
@@ -266,10 +269,28 @@ def restore_undelivered_completions(target_queue) -> int:
     legacy single-session behavior) must leave them queued for a consumer that can positively prove
     ownership, otherwise a brand-new session adopts a dead session's delegation results seconds after boot
     (#64484).
+
+    A row that went ``dropped`` only because its delivery budget ran out — typically a consumer that kept
+    refusing for a transient reason (stale-runtime barrier during an update, maintenance gate) until the
+    process restarted — is rehabilitated here: back to ``pending`` with a fresh budget, as long as the result
+    is still within the replay age. Drops whose target is permanently gone (``target_gone``) or that aged out
+    (``replay_age``) stay terminal. Rows dropped before ``drop_reason`` existed are trusted only through the
+    exhausted-budget signature.
     """
     recover_abandoned_delegations()
     now, restored = time.time(), 0
     with _DB_LOCK, _transaction() as conn:
+        rehabilitated = conn.execute("""UPDATE async_delegations
+               SET delivery_state='pending', delivery_attempts=0, drop_reason=NULL,
+                   delivery_claim=NULL, delivery_claimed_at=NULL, updated_at=?
+               WHERE delivery_state='dropped' AND event_json IS NOT NULL
+                 AND (drop_reason='attempts_exhausted'
+                      OR (drop_reason IS NULL AND delivery_attempts>=?))
+                 AND (? - COALESCE(completed_at, dispatched_at)) <= ?""",
+            (now, _MAX_DELIVERY_ATTEMPTS, now, _MAX_COMPLETION_REPLAY_AGE_S)).rowcount
+        if rehabilitated:
+            logger.warning("Async delegations: rehabilitated %d completion(s) dropped by budget exhaustion; "
+                           "replaying with a fresh delivery budget.", rehabilitated)
         rows = conn.execute("""SELECT delegation_id, event_json, completed_at, dispatched_at
                FROM async_delegations
                WHERE state != 'running' AND delivery_state='pending' AND event_json IS NOT NULL
@@ -278,6 +299,7 @@ def restore_undelivered_completions(target_queue) -> int:
             age_basis = completed_at or dispatched_at
             if age_basis and (now - age_basis) > _MAX_COMPLETION_REPLAY_AGE_S:
                 conn.execute("""UPDATE async_delegations SET delivery_state='dropped',
+                              drop_reason='replay_age',
                               delivery_claim=NULL, delivery_claimed_at=NULL,
                               updated_at=?
                        WHERE delegation_id=? AND delivery_state='pending'""", (now, delegation_id))
@@ -332,20 +354,47 @@ def claim_event_delivery(evt: Dict[str, Any], consumer: str) -> Optional[str]:
     return claim_id if claim_completion_delivery(delegation_id, claim_id) else None
 
 
-def release_completion_delivery(delegation_id: str, claim_id: str) -> bool:
+def release_completion_delivery(delegation_id: str, claim_id: str, *, retryable: bool = False) -> bool:
     """Release a failed delivery claim so another consumer may retry. Attempts are
     counted at claim time; once the budget is exhausted the row converges to
-    terminal ``dropped`` (only pending rows replay on restart)."""
+    terminal ``dropped`` (only pending rows replay on restart).
+
+    ``retryable=True`` means the consumer was *refused for a transient reason it
+    did not cause* (stale-runtime barrier during an update, maintenance gate, a
+    busy foreground turn): the claimed attempt is refunded so the budget only
+    measures real delivery failures. Such a row is bounded by the replay age,
+    not by the attempt count — a result nobody can receive for 48 h is dropped
+    with ``drop_reason='replay_age'``."""
     now = time.time()
     with _DB_LOCK, _transaction() as conn:
+        if retryable:
+            aged = conn.execute("""UPDATE async_delegations SET delivery_state='dropped',
+                          drop_reason='replay_age',
+                          delivery_claim=NULL, delivery_claimed_at=NULL, updated_at=?
+                   WHERE delegation_id=? AND delivery_state='pending' AND delivery_claim=?
+                     AND (? - COALESCE(completed_at, dispatched_at)) > ?""",
+                (now, delegation_id, claim_id, now, _MAX_COMPLETION_REPLAY_AGE_S))
+            if aged.rowcount == 1:
+                logger.warning("Async delegation %s: retryable refusals kept it undeliverable past the "
+                               "%.1fh replay age; terminally dropping (result remains queryable).",
+                               delegation_id, _MAX_COMPLETION_REPLAY_AGE_S / 3600.0)
+                return True
+            cur = conn.execute("""UPDATE async_delegations SET delivery_claim=NULL,
+                          delivery_claimed_at=NULL, updated_at=?,
+                          delivery_attempts=MAX(delivery_attempts-1, 0)
+                   WHERE delegation_id=? AND delivery_state='pending'
+                     AND delivery_claim=?""", (now, delegation_id, claim_id))
+            return cur.rowcount == 1
         capped = conn.execute("""UPDATE async_delegations SET delivery_state='dropped',
+                      drop_reason='attempts_exhausted',
                       delivery_claim=NULL, delivery_claimed_at=NULL, updated_at=?
                WHERE delegation_id=? AND delivery_state='pending'
                  AND delivery_claim=? AND delivery_attempts>=?""",
             (now, delegation_id, claim_id, _MAX_DELIVERY_ATTEMPTS))
         if capped.rowcount == 1:
             logger.warning("Async delegation %s exhausted its %d delivery attempts; "
-                           "marking terminally dropped (result remains queryable).",
+                           "marking terminally dropped (result remains queryable; "
+                           "a restart rehabilitates it while within the replay age).",
                            delegation_id, _MAX_DELIVERY_ATTEMPTS)
             return True
         cur = conn.execute("""UPDATE async_delegations SET delivery_claim=NULL,
@@ -361,6 +410,7 @@ def drop_completion_delivery(delegation_id: str, claim_id: str) -> bool:
     ``dropped`` — not ``delivered`` — keeps the ack honest; not ``pending`` keeps
     restart recovery from replaying it into a fail-closed drop forever."""
     return _update_delivery("""UPDATE async_delegations SET delivery_state='dropped',
+                  drop_reason='target_gone',
                   updated_at=?, delivery_claim=NULL,
                   delivery_claimed_at=NULL
            WHERE delegation_id=? AND delivery_state='pending'
@@ -381,8 +431,9 @@ def complete_event_delivery(evt: Dict[str, Any], claim_id: str) -> None:
     _event_delivery(complete_completion_delivery, evt, claim_id)
 
 
-def release_event_delivery(evt: Dict[str, Any], claim_id: str) -> None:
-    _event_delivery(release_completion_delivery, evt, claim_id)
+def release_event_delivery(evt: Dict[str, Any], claim_id: str, *, retryable: bool = False) -> None:
+    if claim_id and evt.get("type") == "async_delegation":
+        release_completion_delivery(str(evt.get("delegation_id") or ""), claim_id, retryable=retryable)
 
 
 def _event_delivery(fn, evt: Dict[str, Any], claim_id: str) -> None:
