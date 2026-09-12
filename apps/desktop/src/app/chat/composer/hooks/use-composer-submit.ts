@@ -34,6 +34,7 @@ import { composerPlainText } from '../rich-editor'
 import { useComposerScope, useComposerSurfaceId } from '../scope'
 import type { ChatBarProps } from '../types'
 
+import { submitConfirmedText } from './confirmed-submit'
 import { freezeQueuedDraftText } from './use-composer-queue'
 
 const sameOccurrence = (a: ComposerAttachment, b: ComposerAttachment) =>
@@ -137,6 +138,7 @@ export function useComposerSubmit({
   const { t } = useI18n()
   const copy = t.desktop
   const replyPaused = useReplyPaused(activeQueueSessionKey, sessionId)
+  const nativeSubmitPending = useRef(false)
 
   // Shared send primitive: fire onSubmit, and if the gateway rejects (accepted
   // === false) or throws, re-stash the draft so the words survive. Repaint it
@@ -246,7 +248,7 @@ export function useComposerSubmit({
 
   useLayoutEffect(
     () =>
-      onComposerSubmitRequest(({ surfaceId: requestedSurfaceId, target, text, displayKind }) => {
+      onComposerSubmitRequest(({ surfaceId: requestedSurfaceId, target, text, displayKind, native }) => {
         if (
           target === scope.target &&
           surfaceId !== null &&
@@ -254,6 +256,24 @@ export function useComposerSubmit({
           paneVisible &&
           !refusesExternalSubmit(inputDisabled, backendTransition)
         ) {
+          if (native) {
+            if (native.sessionId !== sessionId || disabled) {
+              return
+            }
+
+            submitConfirmedText({
+              busy,
+              key: activeQueueSessionKeyRef.current,
+              native,
+              onSubmit,
+              pending: nativeSubmitPending,
+              sessionId,
+              text
+            })
+
+            return
+          }
+
           const current = externalSubmitRef.current
           const queueKey = activeQueueSessionKeyRef.current
 
@@ -328,7 +348,7 @@ export function useComposerSubmit({
           }
         }
       }),
-    [activeQueueSessionKeyRef, backendTransition, inputDisabled, paneVisible, scope.target, sessionId, surfaceId]
+    [activeQueueSessionKeyRef, backendTransition, busy, disabled, inputDisabled, onSubmit, paneVisible, scope.target, sessionId, surfaceId]
   )
 
   // A phone keyboard the user put away stays down after a send, so the reply

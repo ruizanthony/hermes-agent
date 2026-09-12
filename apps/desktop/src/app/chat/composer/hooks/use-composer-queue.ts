@@ -11,6 +11,7 @@ import { resetBrowseState } from '@/store/composer-input-history'
 import {
   $parkedQueueSessions,
   $queuedPromptsBySession,
+  claimConfirmedQueuedPrompt,
   clearQueuedPromptDrainFailures,
   enqueueQueuedPrompt,
   getQueuedPrompts,
@@ -20,6 +21,7 @@ import {
   promoteQueuedPrompt,
   type QueuedPromptEntry,
   queuedSubmissionId,
+  releaseConfirmedQueuedPrompt,
   removeQueuedPrompt,
   removeSentQueuedPrompt,
   resolveQueuedPromptTransport,
@@ -537,6 +539,10 @@ export function useComposerQueue({
             return false
           }
 
+          if (entry.confirmedExternal && !claimConfirmedQueuedPrompt(drainQueueSessionKey, entry.id)) {
+            return null
+          }
+
           const accepted = await Promise.resolve(
             onSubmit(resolved.transportText, {
               attachments: entry.attachments,
@@ -544,11 +550,16 @@ export function useComposerQueue({
               ...(entry.displayKind ? { displayKind: entry.displayKind } : {}),
               fromQueue: true,
               submission_id: queuedSubmissionId(entry),
+              ...(entry.confirmedExternal ? { confirmedExternal: true } : {}),
               ...queueDrainTarget(drainQueueSessionKey, drainRuntimeSessionId)
             })
           )
 
           if (accepted !== true) {
+            if (entry.confirmedExternal && accepted === false) {
+              releaseConfirmedQueuedPrompt(drainQueueSessionKey, entry.id)
+            }
+
             return false
           }
 
@@ -591,6 +602,10 @@ export function useComposerQueue({
     (id: string) => {
       // Held like the rest of the queue while the profile's backend is in a planned transition (runDrain).
       if (backendSwitching || !activeQueueSessionKey || id === queueEdit?.entryId) {
+        return false
+      }
+
+      if (busy && getQueuedPrompts(activeQueueSessionKey).find(entry => entry.id === id)?.confirmedExternal) {
         return false
       }
 
