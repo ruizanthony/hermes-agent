@@ -148,7 +148,9 @@ it is never the first signal a live parent receives.
 Spawns a subagent with isolated context + terminal session. A top-level model call returns a delegation id and
 re-enters the result via the async-delegation completion queue where the session can receive it and does not join
 inline (`delegation.gateway_mode`); elsewhere, or while the background pool is full, the parent waits for the
-summary (a model-sent `background` arg is ignored; direct Python callers default to synchronous). Shapes: single
+summary (a model-sent `background` arg is ignored; direct Python callers default to synchronous).
+New ids use full UUIDs; terminal results carry presentation-only `hermes.internal_event.v1`
+(`delegation_events.py`). Replay keeps old ids; early failures are nonterminal. Shapes: single
 (`goal` + optional `context`, `toolsets`) or batch (`tasks: [...]`, concurrency capped by
 `delegation.max_concurrent_children`, default 10). A background batch returns as ONE
 completion by default; with `delegation.independent_completions` it is split into completion **units**
