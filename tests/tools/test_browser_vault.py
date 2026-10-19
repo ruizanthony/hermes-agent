@@ -30,6 +30,7 @@ from agent.vault_login_classifier import (
     LoginControl,
     build_fill_js,
     classify_login_control,
+    lone_new_password_control,
     select_password_fill,
 )
 from agent.vault_store import (
@@ -219,6 +220,21 @@ class TestClassifier:
         pw2 = ClassifiedLoginControl(_ctrl(index=2, type="password"), 90, "current-password")
         fills = select_password_fill([pw1, pw2], "p")
         assert len(fills) == 1 and fills[0]["index"] == 1
+
+    def test_lone_new_password_control_is_the_single_password_input(self):
+        user = _ctrl(index=0, type="email")
+        pw = _ctrl(index=1, type="password", autocomplete="new-password", label="Password")
+        assert lone_new_password_control([user, pw]) == pw
+
+    def test_lone_new_password_control_refuses_explicit_rotation_and_otp(self):
+        pw = _ctrl(index=1, type="password", autocomplete="new-password", label="Password")
+        confirm = _ctrl(index=2, type="password", autocomplete="new-password", label="Confirm password")
+        assert lone_new_password_control([pw, confirm]) is None  # a second password input: creation/reset form
+        for label in ("New password", "Create password", "Confirm password", "Repeat password"):
+            assert lone_new_password_control([_ctrl(type="password", autocomplete="new-password", label=label)]) is None, label
+        assert lone_new_password_control([_ctrl(type="password", autocomplete="current-password")]) is None
+        assert lone_new_password_control([_ctrl(type="text", autocomplete="new-password")]) is None
+        assert lone_new_password_control([_ctrl(type="password", autocomplete="new-password one-time-code")]) is None
 
 
     def test_build_fill_js_leaves_no_dom_marker_and_binds_target_to_inspection(self):
@@ -495,6 +511,67 @@ class TestBrowserVaultTools:
         assert out["error_type"] == "supervisor_required"
         assert all(call.args[1] == "get" for call in run_cmd.call_args_list), run_cmd.call_args_list
         assert "s3cret-pw" not in json.dumps([str(c) for c in run_cmd.call_args_list]) and "s3cret-pw" not in raw
+
+    # Sign-in page whose only password input says autocomplete="new-password" (#110645; Azure AD B2C does it too).
+    _NEW_PASSWORD_LOGIN = [
+        {"autocomplete": "", "formIndex": 0, "index": 0, "label": "Browser ID", "name": " browserId", "type": "text"},
+        {"autocomplete": "new-password", "formIndex": 0, "index": 1, "label": "Password", "name": " password", "type": "password"},
+    ]
+
+    def _fill_new_password_page(self, store, origins, controls=None):
+        from tools import browser_vault_tool
+
+        meta = _add_login(store, origin="https://login.example.com")
+        controls = self._NEW_PASSWORD_LOGIN if controls is None else controls
+        secret_exprs = []
+
+        def fake_eval(task_id, expression):
+            if "location.href" in expression:
+                return {"success": True, "result": "https://login.example.com/oauth2/authorize"}
+            return {"success": True, "result": json.dumps(controls)}
+
+        def fake_eval_secret(task_id, expression):
+            secret_exprs.append(expression)
+            return {"success": True, "result": json.dumps({"filled": 1})}
+
+        cfg = {"vault": {"new_password_login_origins": origins}}
+        with patch("agent.vault_store.get_vault_store", return_value=store), \
+             patch("hermes_cli.config.load_config_readonly", return_value=cfg), \
+             patch.object(browser_vault_tool, "_eval_js", side_effect=fake_eval), \
+             patch.object(browser_vault_tool, "_eval_js_secret", side_effect=fake_eval_secret):
+            raw = browser_vault_tool.browser_vault_fill(meta.id)
+        return json.loads(raw), raw, secret_exprs
+
+    def test_new_password_login_field_refused_by_default_with_the_reason(self, store):
+        out, raw, secret_exprs = self._fill_new_password_page(store, [])
+        assert out["success"] is False
+        assert out["error_type"] == "new_password_field"
+        assert "vault.new_password_login_origins" in out["error"]
+        assert secret_exprs == []
+        assert "s3cret-pw" not in raw
+
+    def test_new_password_login_field_filled_on_an_opted_in_origin(self, store):
+        out, raw, secret_exprs = self._fill_new_password_page(store, ["https://login.example.com/"])
+        assert out["success"] is True and out["filled_fields"] == 1
+        assert len(secret_exprs) == 1
+        assert '"index": 1' in secret_exprs[0] and "s3cret-pw" in secret_exprs[0]
+        assert "s3cret-pw" not in raw
+
+    def test_opt_in_refuses_a_second_password_input(self, store):
+        reset = self._NEW_PASSWORD_LOGIN + [
+            {"autocomplete": "new-password", "formIndex": 0, "index": 2, "label": "Confirm password",
+             "name": " reenterPassword", "type": "password"},
+        ]
+        out, raw, secret_exprs = self._fill_new_password_page(store, ["https://login.example.com"], controls=reset)
+        assert out["success"] is False
+        assert secret_exprs == []
+        assert "s3cret-pw" not in raw
+
+    def test_opt_in_is_exact_origin(self, store):
+        out, _raw, secret_exprs = self._fill_new_password_page(
+            store, ["https://example.com", "https://sso.login.example.com", "not an origin"])
+        assert out["success"] is False and out["error_type"] == "new_password_field"
+        assert secret_exprs == []
 
 
     def test_vault_canary_redacted_from_browser_cdp_results(self, store):

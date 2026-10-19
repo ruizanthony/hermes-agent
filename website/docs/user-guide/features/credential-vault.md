@@ -107,6 +107,30 @@ vault:
     enabled: false
 ```
 
+## Sign-in pages that mark the password as "new"
+
+A few sign-in pages tag their only password input `autocomplete="new-password"`
+to keep browsers from autofilling it (some Azure AD B2C tenants, some router
+admin pages). The vault never fills a password-creation field by default, so it
+refuses there and says why. If the page really is the site's normal sign-in
+page, list its exact origin:
+
+```yaml
+vault:
+  new_password_login_origins:
+    - https://login.example.com
+```
+
+On a listed origin the vault fills that field only when it is the page's one
+password input and its label does not say new, confirm, create or repeat
+password. The `one-time-code` exclusion still applies. Forms with a second
+password input or an explicit creation/reset label are refused.
+
+This is a deliberate per-origin exception, not proof that a form is a login:
+a single-field signup or reset form with a generic label can look identical.
+Only opt in an origin you trust for this behavior, and do not use this setting
+as protection against a compromised site or a reset flow on that same origin.
+
 ## What this does and does not guarantee
 
 **Does:** the password never enters the model's context through Hermes: not in

@@ -153,6 +153,29 @@ def classify_otp_controls(controls: list[LoginControl]) -> list[ClassifiedLoginC
     return out
 
 
+def lone_new_password_control(controls: list[LoginControl]) -> Optional[LoginControl]:
+    """The page's single password input, when the site marks it ``autocomplete="new-password"``.
+
+    Some sign-in pages tag their only password input ``new-password`` to defeat browser autofill
+    (Azure AD B2C tenants, the Netgear Orbi admin page in #110645). ``classify_login_control`` keeps
+    excluding that token: a stored password must never be pushed into a creation or reset form. The fill
+    path uses this control only on an origin the user listed in ``vault.new_password_login_origins``, and
+    only when it is the one visible password input on the page and its name/label does not say
+    new/confirm/create/repeat password. These checks reject explicit rotation forms, but cannot
+    distinguish a single-field reset form with a generic label on the same opted-in origin.
+    """
+    passwords = [c for c in controls if c.type == "password"]
+    if len(passwords) != 1:
+        return None
+    only = passwords[0]
+    tokens = only.autocomplete.lower().split()
+    if "new-password" not in tokens or "one-time-code" in tokens:
+        return None
+    if _RE_EXCLUDED_PASSWORD.search(_normalize_text(" ".join(p for p in (only.name, only.label) if p))):
+        return None
+    return only
+
+
 def select_password_fill(
     classified: list[ClassifiedLoginControl],
     password: str,

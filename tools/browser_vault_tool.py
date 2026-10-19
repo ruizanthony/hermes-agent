@@ -175,6 +175,28 @@ def _parse_json_result(raw: Any) -> Any:
     return raw
 
 
+def _new_password_login_origins() -> frozenset[str]:
+    """Origins the user listed under ``vault.new_password_login_origins`` in config.yaml: sign-in pages that
+    mark their only password input ``autocomplete="new-password"`` (#110645). Exact origins, nothing inferred;
+    an invalid entry is ignored and an unreadable config allows nothing."""
+    from agent.vault_store import VaultError, normalize_origin
+    from hermes_cli.config import load_config_readonly
+
+    try:
+        vault_cfg = load_config_readonly().get("vault")
+    except (OSError, ValueError, TypeError):
+        logger.debug("vault: could not read vault.new_password_login_origins", exc_info=True)
+        return frozenset()
+    raw = vault_cfg.get("new_password_login_origins") if isinstance(vault_cfg, dict) else None
+    origins: set[str] = set()
+    for entry in [raw] if isinstance(raw, str) else (raw if isinstance(raw, (list, tuple)) else ()):
+        try:
+            origins.add(normalize_origin(str(entry)))
+        except VaultError:
+            continue
+    return frozenset(origins)
+
+
 def _current_page_origin(task_id: str) -> Optional[str]:
     res = _eval_js(task_id, "window.location.href")
     if not res.get("success"):
@@ -412,6 +434,7 @@ def browser_vault_fill(handle: str, task_id: Optional[str] = None) -> str:
         build_inspection_js,
         classify_checkout_control,
         classify_login_control,
+        lone_new_password_control,
         select_checkout_fills,
         select_password_fill,
     )
@@ -491,14 +514,12 @@ def browser_vault_fill(handle: str, task_id: Optional[str] = None) -> str:
         return json.dumps({"success": False, "error": "Page input inspection returned no usable controls."})
 
     classify = classify_login_control if meta.kind == "login" else classify_checkout_control
-    classified: list[ClassifiedLoginControl] = []
-    for raw in raw_controls:
-        if not isinstance(raw, dict):
-            continue
-        result = classify(LoginControl.from_dict(raw))
-        if result is not None:
-            classified.append(result)
-    if not classified:
+    controls = [LoginControl.from_dict(raw) for raw in raw_controls if isinstance(raw, dict)]
+    classified: list[ClassifiedLoginControl] = [c for c in map(classify, controls) if c is not None]
+    # A sign-in page whose only password input says autocomplete="new-password" (#110645): excluded by the
+    # classifier, fillable only on an origin the user opted in (see _new_password_login_origins).
+    lone_new_password = lone_new_password_control(controls) if meta.kind == "login" else None
+    if not classified and lone_new_password is None:
         return json.dumps({"success": False, "error": f"No {meta.kind} form fields were found on the current page."})
 
     # ── Resolve secret and fill (secret never enters any logged string) ─────
@@ -506,12 +527,21 @@ def browser_vault_fill(handle: str, task_id: Optional[str] = None) -> str:
         if meta.kind == "login":
             secret = {"password": backend.resolve_password(handle)}
             fills = select_password_fill(classified, secret["password"])
+            if (not fills and lone_new_password is not None and secret["password"]
+                    and page_origin in _new_password_login_origins()):
+                fills = [{"index": lone_new_password.index, "token": "current-password", "value": secret["password"]}]
         else:
             secret = backend.resolve_secret(handle)
             fills = select_checkout_fills(classified, secret, PAYMENT_FIELDS if meta.kind == "payment" else ADDRESS_FIELDS)
     except UnlockRequired:
         return json.dumps({"success": False, "error_type": "unlock_required",
                            "error": f"{backend.display_name} locked again; call browser_vault action=unlock."})
+    if not fills and lone_new_password is not None:
+        return json.dumps({"success": False, "error_type": "new_password_field", "error": (
+            "Not filled: this page's only password input is marked autocomplete=\"new-password\", a password-creation "
+            "field the vault never fills by default. If this is the site's normal sign-in page, the user can allow "
+            f"it by adding {page_origin} to vault.new_password_login_origins in config.yaml. Do not type the "
+            "password yourself.")})
     if not fills:
         return json.dumps(
             {"success": False, "error": f"No fillable {meta.kind} field matched the saved item on this page."}
