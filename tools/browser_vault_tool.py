@@ -216,8 +216,22 @@ def _focus_bound_origin(task_id: str, origin: str, kind: str) -> Optional[str]:
 # Handlers
 # ---------------------------------------------------------------------------
 
-def browser_vault_list() -> str:
+# Above this many items an unfiltered list returns a count and asks for a query: every handle carries its site
+# and identifier, so listing a vault of hundreds of logins costs tens of thousands of tokens per call and puts
+# every identifier in the context.
+_LIST_UNFILTERED_MAX = 50
+
+
+def _list_entry_matches(entry: dict[str, Any], needle: str) -> bool:
+    fields = [entry.get("origin"), entry.get("label"), entry.get("identifier"), *entry.get("allowed_origins", ())]
+    return any(needle in str(value).lower() for value in fields if value)
+
+
+def browser_vault_list(query: str = "") -> str:
     """List login handles + metadata across every enabled backend. Passwords are never included.
+
+    ``query`` keeps only items whose site, label or identifier contains it (case-insensitive). Without a query,
+    a vault larger than ``_LIST_UNFILTERED_MAX`` reports its size instead of every handle.
 
     A locked external manager contributes no items; instead it is reported under ``locked`` so the
     agent knows to call fill (which prompts the user to unlock) or tell the user.
@@ -247,8 +261,18 @@ def browser_vault_list() -> str:
                 entry["identifier"] = meta.identifier
                 entry["identifier_type"] = meta.identifier_type
             items.append(entry)
+    needle = (query or "").strip().lower()
+    if needle:
+        items = [entry for entry in items if _list_entry_matches(entry, needle)]
     out: dict[str, Any] = {"success": True, "items": items}
-    if not items:
+    if not needle and len(items) > _LIST_UNFILTERED_MAX:
+        out = {"success": True, "items": [], "total": len(items),
+               "hint": (f"{len(items)} saved items: call list again with query=<site>, part of the login page's "
+                        "host (e.g. 'github'), to get the matching handles.")}
+    elif not items and needle:
+        out["hint"] = (f"No saved item matches {query.strip()!r}. Try a shorter part of the site's host; if nothing "
+                       "is saved for this site, call browser_vault action=save_login on its login page.")
+    elif not items:
         out["hint"] = ("No saved logins. On a login page, call browser_vault action=save_login to ask the user to save one. "
                        "Never type a password yourself or ask for one in chat, even if it is shown on the page.")
     if locked:
@@ -590,8 +614,9 @@ BROWSER_VAULT_SCHEMA = {
     "description": (
         "Use saved logins, passwords, credentials, cards and addresses on the CURRENT browser page without secrets "
         "entering the conversation. "
-        "Actions: list (call first: saved logins/cards/addresses as handles; logins carry the identifier you type "
-        "yourself with the browser's input tool; locked password managers appear under `locked`); fill (handle: "
+        "Actions: list (call first, with query=<site> when you know it: saved logins/cards/addresses as handles; logins "
+        "carry the identifier you type yourself with the browser's input tool; locked password managers appear under "
+        "`locked`); fill (handle: "
         "the password for a login, card fields after the user confirms, address fields; refused unless the page "
         "origin matches the item); save_login (nothing saved for this site: the user enters it in a masked prompt, "
         "Hermes saves and fills it); enter_code (a one-time/2FA code after the password: generated from a saved "
@@ -607,6 +632,8 @@ BROWSER_VAULT_SCHEMA = {
             "handle": {"type": "string", "description": "fill / enter_code: a handle from list."},
             "backend": {"type": "string", "enum": ["onepassword", "bitwarden"], "description": "unlock only."},
             "label": {"type": "string", "description": "save_login only: short site name (default: the host)."},
+            "query": {"type": "string", "description": ("list only: part of the site's host, label or identifier "
+                                                        "(e.g. 'github'); a large vault lists handles only with it.")},
         },
         "required": ["action"],
     },
@@ -636,7 +663,7 @@ def _handle_vault(args: dict[str, Any], **kwargs) -> str:
     action = str(args.get("action") or "")
     handle, label = str(args.get("handle") or ""), str(args.get("label") or "")
     if action == "list":
-        return browser_vault_list()
+        return browser_vault_list(str(args.get("query") or ""))
     if action == "unlock":
         return browser_vault_unlock(str(args.get("backend") or ""))
     page_ops = {

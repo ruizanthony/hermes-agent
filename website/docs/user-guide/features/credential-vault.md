@@ -30,7 +30,8 @@ a masked password field. *Save & sign in* stores it and continues; *Don't save*
 tells the agent to stop asking for this turn.
 
 From then on the agent lists your saved logins, types the identifier itself and
-fills the password through Hermes. The tool result it sees is
+fills the password through Hermes. With more than 50 saved items it searches
+them by site (`query`) instead of listing them all. The tool result it sees is
 `{filled_fields: 1, origin: "https://github.com"}`; the password is also
 registered with the redactor so a later page read cannot echo it back.
 

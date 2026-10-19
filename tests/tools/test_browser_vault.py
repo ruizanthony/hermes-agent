@@ -285,6 +285,44 @@ class TestBrowserVaultTools:
         assert out["items"][0]["identifier_type"] == "email"
         assert "s3cret-pw" not in json.dumps(out)
 
+    def test_list_query_matches_site_label_or_identifier(self, store):
+        from tools import browser_vault_tool
+
+        _add_login(store, origin="https://github.com")
+        _add_login(store, origin="https://shop.example.org")
+        with patch("agent.vault_store.get_vault_store", return_value=store):
+            by_site = json.loads(browser_vault_tool.browser_vault_list(query=" GitHub "))
+            by_identifier = json.loads(browser_vault_tool.browser_vault_list(query="user@example"))
+            none = json.loads(browser_vault_tool.browser_vault_list(query="gitlab"))
+        assert [i["origin"] for i in by_site["items"]] == ["https://github.com"]
+        assert len(by_identifier["items"]) == 2
+        assert none["items"] == [] and "gitlab" in none["hint"]
+
+    def test_large_vault_needs_a_query_to_list_handles(self, store):
+        """Every handle carries its site and identifier: a vault of hundreds of logins listed in full costs tens of
+        thousands of tokens per call and puts every identifier in the context. Past the cap, an unfiltered list
+        returns the count and asks for a query."""
+        from tools import browser_vault_tool
+
+        for host in ("a.example.com", "b.example.com", "c.example.com"):
+            _add_login(store, origin=f"https://{host}")
+        with patch("agent.vault_store.get_vault_store", return_value=store), \
+             patch.object(browser_vault_tool, "_LIST_UNFILTERED_MAX", 2):
+            unfiltered = json.loads(browser_vault_tool.browser_vault_list())
+            filtered = json.loads(browser_vault_tool.browser_vault_list(query="b.example"))
+        assert unfiltered["items"] == [] and unfiltered["total"] == 3
+        assert "query" in unfiltered["hint"]
+        assert "user@example.com" not in json.dumps(unfiltered)
+        assert [i["origin"] for i in filtered["items"]] == ["https://b.example.com"]
+
+    def test_list_action_forwards_query(self):
+        from tools import browser_vault_tool
+
+        assert "query" in browser_vault_tool.BROWSER_VAULT_SCHEMA["parameters"]["properties"]
+        with patch.object(browser_vault_tool, "browser_vault_list", return_value="{}") as listed:
+            browser_vault_tool._handle_vault({"action": "list", "query": "github"})
+        listed.assert_called_once_with("github")
+
     def test_fill_refused_on_origin_mismatch(self, store):
         from tools import browser_vault_tool
 
