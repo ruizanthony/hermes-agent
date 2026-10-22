@@ -475,6 +475,27 @@ def _reparented_orphan(pid: int) -> bool:
         return False  # unprovable → never touch
 
 
+def _service_manager_owns(entry: dict, pid: int) -> bool:
+    """Is *pid* a service manager's backend: a systemd unit's live ``MainPID`` or a loaded launchd job's?
+
+    Both orphan rungs misread one. A unit-launched dashboard records no spawner and sits at ppid 1;
+    a KeepAlive LaunchAgent's recorded spawner is its long-dead bootstrap shell. Reaping it stops the
+    operator's supervised service, whose restart then refuses behind the reclaimer (exit 78) for as
+    long as the reclaimer lives. Same ownership proofs the updater classifies with (#141021,
+    #116503); an unprovable probe reads as not owned, exactly as before this guard.
+    """
+    try:
+        from hermes_cli import update_inventory as _inv
+
+        if _inv._systemd_owner_for_ledger_pid(pid):
+            return True
+        jobs = _inv._loaded_backend_launchd_jobs()
+        return bool(jobs and _inv._launchd_owner_for_ledger_entry(entry, pid, jobs))
+    except Exception:
+        logger.debug("service-manager ownership probe failed for pid %s", pid, exc_info=True)
+        return False
+
+
 def reap_orphaned_backend_owner(
     pid: int, create_time: Optional[float], *, kill_fn=None) -> Optional[int]:
     """Kill the conflicting host owner when the ledger PROVES it is a dead session's orphan.
@@ -484,7 +505,8 @@ def reap_orphaned_backend_owner(
     same orphan forever. Reaped only with a live ``serve``/``dashboard``/``gateway`` entry for
     THIS install whose spawner is provably dead — or whose spawner was never recorded and which
     is reparented to init, old, and claimed by no Desktop SSH lock. Live-spawned, lock-claimed,
-    young, interactive, self, or unprovable owners are never touched. Returns the reaped pid,
+    service-managed (systemd unit / launchd job), young, interactive, self, or unprovable owners
+    are never touched. Returns the reaped pid,
     else ``None``; never raises.
 
     # ponytail: a dead session's surviving backend.lock.json still shields its orphan (the lock
@@ -511,6 +533,8 @@ def reap_orphaned_backend_owner(
     if spawner_is_dead(entry) is not True and not (
             entry.get("spawner_pid") is None and _reparented_orphan(pid)):
         return None  # live or unprovable spawner → never touch
+    if _service_manager_owns(entry, pid):
+        return None  # supervised: ppid 1 / a dead bootstrap spawner is not a dead session
     try:
         if kill_fn is not None:
             kill_fn(pid)

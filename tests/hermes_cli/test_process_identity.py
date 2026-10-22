@@ -315,13 +315,23 @@ def test_desktop_ssh_backend_spawn_shape_is_desktop_owned(monkeypatch):
 # Host-reclaim rung: reap_orphaned_backend_owner (#121964)
 # ---------------------------------------------------------------------------
 
-def _reap(entry_pid=555, create=55.0, procs=None, kill_fn=None, **entry_kw):
-    """Run the reclaim predicate with a faked psutil world; returns (result, kills)."""
+def _reap(entry_pid=555, create=55.0, procs=None, kill_fn=None, systemd_unit=None,
+          launchd_job=None, **entry_kw):
+    """Run the reclaim predicate with a faked psutil world; returns (result, kills).
+
+    The service-manager probes are faked too (no unit, no launchd job by default), so no case
+    reads the runner's real /proc or systemctl."""
+    from hermes_cli import update_inventory
+
     entry = _entry(entry_pid, create, **entry_kw)
     kills = []
     fake = _fake_psutil({} if procs is None else procs)
     with patch.dict(sys.modules, {"psutil": fake}), \
-         patch.object(pi, "ledger_entries", return_value=[entry]):
+         patch.object(pi, "ledger_entries", return_value=[entry]), \
+         patch.object(update_inventory, "_systemd_owner_for_ledger_pid", return_value=systemd_unit), \
+         patch.object(update_inventory, "_loaded_backend_launchd_jobs",
+                      return_value=[] if launchd_job is None else ["job"]), \
+         patch.object(update_inventory, "_launchd_owner_for_ledger_entry", return_value=launchd_job):
         result = pi.reap_orphaned_backend_owner(
             entry_pid, create, kill_fn=(kills.append if kill_fn is None else kill_fn))
     return result, kills
@@ -368,6 +378,29 @@ def test_reclaim_reaps_null_spawner_orphan_to_init():
         result, kills = _reap(procs={555: 1000.0}, create=1000.0)
     assert result == 555
     assert kills == [555]
+
+
+def test_reclaim_spares_systemd_unit_main_pid():
+    """A dashboard a systemd unit launched has no recorded spawner and sits at ppid 1 like an
+    orphan, but systemd supervises it: reaping it stops the operator's service, and its restart
+    then refuses behind the reclaimer (exit 78) for as long as the reclaimer lives."""
+    from hermes_cli import dashboard_procs
+
+    with patch.object(dashboard_procs, "_process_ppid", return_value=1), \
+         patch.object(dashboard_procs, "_lock_owned_serve_pids", return_value=set()):
+        result, kills = _reap(procs={555: 1000.0}, create=1000.0,
+                              systemd_unit=("hermes-dashboard.service", "system"))
+    assert result is None
+    assert kills == []
+
+
+def test_reclaim_spares_launchd_job_with_dead_bootstrap_spawner():
+    """A KeepAlive LaunchAgent backend's recorded spawner (the bootstrap shell) is long dead, yet
+    launchd owns the backend (#116503): a dead spawner is not a dead session there either."""
+    result, kills = _reap(spawner_pid=700, spawner_create=7.0, procs={555: 55.0},
+                          launchd_job=("gui/501", "ai.hermes.dashboard", 555))
+    assert result is None
+    assert kills == []
 
 
 def test_reclaim_spares_null_spawner_with_live_parent():
