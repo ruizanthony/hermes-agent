@@ -205,9 +205,16 @@ def restore_local_session(authority, sid):
             store._ensure_loaded_locked()
             current = store._entries.get(route)
             if current is not None and current.session_id != target:
-                if not _stray_route_target(authority, receipt, current.session_id):
+                if current.session_id in receipt.get('lineage', [sid]):
+                    # An older segment of this very conversation: the loaded store missed a
+                    # compression. Rebind it to the receipt's target, as the live branch does.
+                    logging.getLogger(__name__).warning(
+                        'Local route for %s named older segment %s of its lineage; rebinding to %s',
+                        sid, current.session_id, target)
+                elif _stray_route_target(authority, receipt, current.session_id):
+                    current = None
+                else:
                     raise RuntimeStoreError('admission_conflict')
-                current = None
             # The receipt is the creation copy; a persisted entry for the same target keeps the
             # route's explicit ``/yolo`` toggle (an OFF over a ``--yolo`` launch must survive a
             # cold restore). An untoggled entry stays None and keeps following the launch policy.
