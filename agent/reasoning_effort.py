@@ -38,8 +38,9 @@ ASTRA_MODEL_IDS: frozenset[str] = frozenset({"gpt-6-astra", "gpt-6-astra-900k"})
 #: GPT-6 Sol/Terra/Luna (the 5.6 successors; ``-pro``/``-900k``/dated snapshots share the prefix).
 GPT6_TIER_PREFIXES: tuple[str, ...] = ("gpt-6-sol", "gpt-6-luna")
 #: GPT-6.1 Sol takes Astra's ``low..max`` ladder (``none`` 400s, live 2026-09-29) without Astra's
-#: account gating, so it stays in the static catalogs.
-NO_DISABLE_TIER_PREFIXES: tuple[str, ...] = ("gpt-6.1-sol",)
+#: account gating, so it stays in the static catalogs. Same for GPT-6.2 Astra and Sol (``none``
+#: 400s ``unsupported_value``, ``max`` accepted, live 2026-11-17).
+NO_DISABLE_TIER_PREFIXES: tuple[str, ...] = ("gpt-6.1-sol", "gpt-6.2-astra", "gpt-6.2-sol")
 DAYBREAK_MODEL_IDS: frozenset[str] = frozenset(
     {"gpt-daybreak-blue-latest", "gpt-daybreak-blue-latest-900k"}
 )

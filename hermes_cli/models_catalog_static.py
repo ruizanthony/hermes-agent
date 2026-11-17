@@ -700,9 +700,11 @@ _LIVE_FIRST_PICKER_PROVIDERS: frozenset[str] = frozenset({"opencode-zen", "openc
 # expose service_tier.
 _OPENAI_FAST_MODE_PREFIXES: tuple[str, ...] = ("gpt-", "o1", "o3", "o4")
 # OpenAI Ultrafast (service_tier="ultrafast", 6x Standard): GPT-6 Astra and GPT-6.1 Sol
-# (developers.openai.com/api/docs/guides/ultrafast-mode, 2026-10-08).
+# (developers.openai.com/api/docs/guides/ultrafast-mode, 2026-10-08), GPT-6.2 Astra and Sol at
+# launch (openai.com/index/introducing-gpt-6-2-astra-sol, 2026-11-17).
 # Exact wire slugs, matched after stripping the vendor prefix and the Hermes-side ``-900k`` alias.
-_OPENAI_ULTRAFAST_MODELS: frozenset[str] = frozenset({"gpt-6-astra", "gpt-6.1-sol"})
+_OPENAI_ULTRAFAST_MODELS: frozenset[str] = frozenset(
+    {"gpt-6-astra", "gpt-6.1-sol", "gpt-6.2-astra", "gpt-6.2-sol"})
 
 
 # Providers where models.dev is authoritative: the curated list is an offline fallback plus custom
