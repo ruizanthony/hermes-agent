@@ -118,7 +118,7 @@ _LINEAGE_MESSAGE_FLOOR_SQL = f"""(s.message_count >= ? OR (s.end_reason = 'compr
           AND {_sql_json_extract('child.model_config', '$._branched_from')} IS NULL
           AND {_sql_json_extract('child.model_config', '$._delegate_from')} IS NULL
           AND NOT ({_RESET_CHILD_SQL.format(a='child')})
-          AND COALESCE(child.source, '') != 'tool'
+          AND NOT {_tool_fork_sql('child.')}
     )
     SELECT 1 FROM _lin JOIN sessions _lin_s ON _lin_s.id = _lin.id WHERE _lin_s.message_count >= ?)))"""
 
